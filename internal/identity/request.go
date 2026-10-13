@@ -10,9 +10,6 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -88,59 +85,57 @@ func StableID(prefix, value string) string {
 
 // canonicalSessionPattern matches OpenCode's canonical session format:
 // "ses_" + 12 lowercase hex timestamp characters + 14 Base62 characters.
-// The Zen free tier decodes the leading 12 hex characters as an inverted
-// millisecond timestamp and rejects any session whose prefix is not one with
-// 403 FreeTierError, so the timestamp half must be minted, not hashed.
+// Since 2026-09-16 the Zen free tier rejects any other session shape with
+// 403 FreeTierError.
 var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+// descendingTimePartPattern matches the time part the official client mints
+// with Identifier.descending(): the 48-bit value ~(ts_ms<<12|counter) in hex.
+// Bitwise NOT sets the low 12 bits, so a genuine time part ends in
+// 0xFFF - counter. Probing the live endpoint shows the free tier accepts
+// counters 1-63 (low 12 bits 0xFC0-0xFFF) and rejects everything beyond with
+// 403 FreeTierError even when the ses_ shape is right, so the pattern accepts
+// exactly that window.
+var descendingTimePartPattern = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`)
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// sessionCacheLimit bounds the signal-to-session cache. Conversation seeds can
-// be large, so entries are keyed by digest and the whole map is dropped when it
-// fills, which costs affinity for the oldest conversations only.
-const sessionCacheLimit = 8192
-
-var (
-	sessionCacheMu sync.Mutex
-	sessionCache   = make(map[string]string)
-	sessionCounter atomic.Uint64
-)
-
 // CanonicalSessionID returns signal unchanged when it already carries an
-// official OpenCode session (preserving upstream prompt-cache affinity).
-// Any other downstream identity (UUIDs, foreign client sessions, legacy
-// gateway sessions, conversation seeds) gets a stable minted session so the
-// same conversation keeps its key/proxy affinity across turns.
+// official OpenCode session minted by the client's Identifier.descending()
+// (preserving upstream prompt-cache affinity). Any other downstream identity
+// (UUIDs, foreign client sessions, legacy gateway sessions, conversation
+// seeds) is deterministically re-encoded into that exact layout — inverted
+// 48-bit millisecond timestamp with counter 1, so the low 12 hex digits are
+// ffe — while keeping the same stable session per conversation. A re-encoded
+// session passes the free tier's encoding check where the raw hash shape was
+// rejected with 403 FreeTierError.
 func CanonicalSessionID(signal string) string {
 	if canonicalSessionPattern.MatchString(signal) {
-		return signal
+		if descendingTimePartPattern.MatchString(signal[4:16]) {
+			return signal
+		}
+		// Right shape but a foreign encoding (raw hash or ascending ID):
+		// fall through and re-encode deterministically.
 	}
 	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	key := string(sum[:])
-	sessionCacheMu.Lock()
-	if id, ok := sessionCache[key]; ok {
-		sessionCacheMu.Unlock()
-		return id
-	}
-	sessionCacheMu.Unlock()
+	timePart := descendingTimePart(sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
-	id := "ses_" + mintedTimePrefix() + randomPart
-	sessionCacheMu.Lock()
-	if len(sessionCache) >= sessionCacheLimit {
-		sessionCache = make(map[string]string)
-	}
-	sessionCache[key] = id
-	sessionCacheMu.Unlock()
-	return id
+	return "ses_" + timePart + randomPart
 }
 
-// mintedTimePrefix renders the 12 hex characters OpenCode derives from
-// ~(unix_ms*0x1000+counter) truncated to its low 48 bits, mirroring the
-// descending ID scheme in the OpenCode client.
-func mintedTimePrefix() string {
-	counter := sessionCounter.Add(1) & 0xfff
-	current := uint64(time.Now().UnixMilli())*0x1000 + counter
-	return fmt.Sprintf("%012x", ^current&0xFFFFFFFFFFFF)
+// descendingTimePart renders six hash bytes as the official client's
+// Identifier.descending() layout: a 36-bit timestamp shifted into the top of
+// a 48-bit word, ORed with counter 1, then bitwise-NOT-ed so the low 12 hex
+// digits read ffe.
+func descendingTimePart(hash []byte) string {
+	current := (uint64(hash[0])<<28 | uint64(hash[1])<<20 | uint64(hash[2])<<12 |
+		uint64(hash[3])<<4 | uint64(hash[4])>>4) << 12
+	current |= 1
+	inverted := ^current & 0xFFFFFFFFFFFF
+	return hex.EncodeToString([]byte{
+		byte(inverted >> 40), byte(inverted >> 32), byte(inverted >> 24),
+		byte(inverted >> 16), byte(inverted >> 8), byte(inverted),
+	})
 }
 
 func base62Fixed(n *big.Int, width int) string {
