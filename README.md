@@ -173,6 +173,8 @@ System One pairs a free-form state with typed questions and returns typed answer
 
 Requests using the upstream's native protocol retain provider-specific fields. Requests crossing protocols pass through a common representation; not every option has an equivalent. For example, Chat JSON output constraints and `seed` are not forwarded to Anthropic Messages. Unsupported content or tool types may be rejected.
 
+Some models, especially on the free lane, write a tool call into the reply text instead of returning a structured call: `<invoke>`/`<parameter>` blocks, the same wrapped in DSML delimiters, or JSON inside `<tool_call>`. When the request declares the tool being called, the gateway recovers the call — streaming and non-streaming, and for every target protocol — so the client receives `tool_calls` / `function_call` / `tool_use` instead of markup it would only display. The text before the block stays a normal reply, arguments are decoded to their JSON types, and nothing is recovered when the tool was not declared, so a model quoting XML in prose is left untouched.
+
 The gateway exposes the routes listed above. It does not implement embeddings, file uploads, image generation, or Responses retrieval and cancellation. It does not store conversation history; clients must supply the history or use features supported by the actual upstream.
 
 ## Routing and models

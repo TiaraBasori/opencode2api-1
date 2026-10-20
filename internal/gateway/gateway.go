@@ -232,6 +232,11 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		model := jsonutil.StringAt(payload, "model")
+		// The names the client offered decide whether text that looks like a
+		// tool call is recovered: a model that merely writes XML in prose
+		// must reach the client untouched. Read once, before the body is
+		// reshaped for the upstream lane.
+		declaredTools := wire.DeclaredToolNames(body)
 		meta := telemetry.MetaFromRequest(r)
 		if meta != nil {
 			meta.Model = model
@@ -352,7 +357,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			if external == upstreamRoute.Protocol {
 				usage, usageReported, err = wire.ForwardStream(r.Context(), w, streamBody, upstreamRoute.Protocol, model)
 			} else {
-				usage, usageReported, err = wire.TranscodeStream(r.Context(), w, streamBody, upstreamRoute.Protocol, external, model)
+				usage, usageReported, err = wire.TranscodeStreamTools(r.Context(), w, streamBody, upstreamRoute.Protocol, external, model, declaredTools)
 			}
 			if meta != nil {
 				meta.Usage, meta.UsageReported = usage, usageReported
@@ -390,8 +395,15 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		if usage, reported := wire.ResponseUsage(upstreamRoute.Protocol, responseBody); meta != nil {
 			meta.Usage, meta.UsageReported = usage, reported
 		}
+		if external == upstreamRoute.Protocol {
+			// Same-protocol replies are passed through byte for byte, so the
+			// only chance to recover a call the model wrote as text is here;
+			// RecoverResponseMarkup returns the body untouched unless it
+			// really found one.
+			responseBody = wire.RecoverResponseMarkup(external, responseBody, declaredTools)
+		}
 		if external != upstreamRoute.Protocol {
-			responseBody, err = wire.ConvertResponse(upstreamRoute.Protocol, external, responseBody)
+			responseBody, err = wire.ConvertResponseTools(upstreamRoute.Protocol, external, responseBody, declaredTools)
 			if err != nil {
 				g.logger.Warn("response protocol conversion failed", "component", "conversion", "event", "response_conversion_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", err)
 				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)

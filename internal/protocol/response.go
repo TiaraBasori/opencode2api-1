@@ -17,6 +17,14 @@ import (
 // upstream error envelope becomes an error, and so does a body the target
 // protocol cannot represent.
 func ConvertResponse(from, to Protocol, body []byte) ([]byte, error) {
+	return ConvertResponseTools(from, to, body, nil)
+}
+
+// ConvertResponseTools is ConvertResponse with a declaration of the tools the
+// client offered in the request. with tools declared, a response whose text is
+// a tool-call markup block is returned as real tool calls (see toolmarkup.go);
+// without them it is left exactly as the model wrote it.
+func ConvertResponseTools(from, to Protocol, body []byte, tools []string) ([]byte, error) {
 	if from == to {
 		return append([]byte(nil), body...), nil
 	}
@@ -30,6 +38,15 @@ func ConvertResponse(from, to Protocol, body []byte) ([]byte, error) {
 	}
 	if response.Error != "" || response.Stop == "error" {
 		return nil, fmt.Errorf("upstream response failed: %s", jsonutil.FirstString(response.Error, "upstream response failed"))
+	}
+	if calls, prose, ok := RecoverToolMarkup(response.Text, tools); ok {
+		response.Text = prose
+		for _, call := range calls {
+			response.Tools = append(response.Tools, bridgeBlock{Kind: "tool", ID: call.ID, Name: call.Name, ArgumentsJSON: call.Arguments})
+		}
+		if !isToolStop(response.Stop) {
+			response.Stop = "tool_calls"
+		}
 	}
 	return json.Marshal(encodeBridgeResponse(to, response))
 }

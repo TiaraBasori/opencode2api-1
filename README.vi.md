@@ -177,6 +177,8 @@ System One ghép một state tự do với các câu hỏi có kiểu và trả 
 
 Request dùng giao thức gốc của upstream sẽ giữ nguyên các trường riêng của nhà cung cấp. Request đi qua nhiều giao thức sẽ đi qua một biểu diễn chung; không phải tuỳ chọn nào cũng có phần tương đương. Ví dụ, ràng buộc output JSON của Chat và `seed` không được chuyển tiếp sang Anthropic Messages. Nội dung hoặc loại tool không được hỗ trợ có thể bị từ chối.
 
+Một số model, nhất là trên kênh miễn phí, viết lệnh gọi tool vào chính văn bản trả lời thay vì trả về một lệnh gọi có cấu trúc: khối `<invoke>`/`<parameter>`, cùng nội dung đó bọc trong dấu DSML, hoặc JSON trong `<tool_call>`. Khi request có khai báo tool đó, gateway khôi phục lại lệnh gọi — cả streaming lẫn không streaming, cho mọi giao thức đích — để client nhận `tool_calls` / `function_call` / `tool_use` thay vì phần markup chỉ để hiển thị. Phần văn bản trước khối vẫn là câu trả lời bình thường, tham số được giải mã về đúng kiểu JSON, và không có gì được khôi phục khi tool không được khai báo, nên model chỉ trích dẫn XML trong văn bản sẽ được giữ nguyên.
+
 Gateway cung cấp đúng các route nêu trên. Nó không triển khai embeddings, tải tệp lên, sinh ảnh, hay truy xuất và huỷ của Responses. Nó không lưu lịch sử hội thoại; client phải tự cung cấp lịch sử hoặc dùng các tính năng được upstream thật hỗ trợ.
 
 ## Định tuyến và mô hình

@@ -73,6 +73,14 @@ type bridgeStreamEvent struct {
 // cancels the request context when the client goes away, and writing after
 // that only wastes the remaining attempt.
 func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) (Usage, bool, error) {
+	return TranscodeStreamTools(ctx, w, reader, from, to, model, nil)
+}
+
+// TranscodeStreamTools is TranscodeStream with a declaration of the tools the
+// client offered. With tools declared, text that a model wrote as markup is
+// recovered into real tool calls instead of reaching the client as prose; every
+// other aspect of the conversion is unchanged.
+func TranscodeStreamTools(ctx context.Context, w http.ResponseWriter, reader io.Reader, from, to Protocol, model string, tools []string) (Usage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
@@ -86,7 +94,34 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		responseReasoning: map[string]bool{},
 	}
 	emitter := bridgeStreamEmitter(w, flusher, to, model)
+	markup := newMarkupExtractor(tools)
 	termination := streamOpen
+	// recovery turns the buffer into tool calls and returns the prose that
+	// precedes them. The calls are opened as synthetic tool blocks and
+	// finished with their complete arguments, which every emitter already
+	// supports; incremental argument deltas are not needed because a recovered
+	// call is only complete once its container closed.
+	recovery := func() error {
+		if markup == nil {
+			return nil
+		}
+		prose, calls := markup.Flush()
+		if prose != "" {
+			if err := emitter.Emit(bridgeStreamEvent{Kind: "text", Text: prose}); err != nil {
+				return err
+			}
+		}
+		for i, call := range calls {
+			key := markupToolKey(i)
+			if err := emitter.Emit(bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: newMarkupToolID(i), ToolName: call.Name}); err != nil {
+				return err
+			}
+			if err := emitter.Emit(bridgeStreamEvent{Kind: "tool_delta", ToolKey: key, Text: call.Arguments}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	readErr := readSSE(reader, func(eventName, data string) error {
 		events, err := parser.Parse(eventName, data)
 		if err != nil {
@@ -102,11 +137,22 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 				termination = streamNormalTermination
 			case "error":
 				termination = streamErrorTermination
+			case "text":
+				// The text may be prose the client should see, markup that
+				// must become a tool call, or too little to tell yet.
+				if prose := markup.Feed(event.Text); prose != "" {
+					event.Text = prose
+				} else {
+					continue
+				}
 			}
 			if err := emitter.Emit(event); err != nil {
 				return err
 			}
 			if event.Kind == "done" {
+				if err := recovery(); err != nil {
+					return err
+				}
 				return errStreamNormalTermination
 			}
 		}
@@ -134,6 +180,11 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 	}
 	if ClientCanceled(ctx, nil) {
 		return emitter.usage, emitter.usageReported, ctx.Err()
+	}
+	// A stream that ended without a terminal event still owes the client any
+	// complete call it wrote and did not finish.
+	if err := recovery(); err != nil {
+		return emitter.usage, emitter.usageReported, err
 	}
 	if err := emitUnexpectedStreamError(emitter, errSSEUnexpectedEOF); err != nil {
 		return emitter.usage, emitter.usageReported, err
