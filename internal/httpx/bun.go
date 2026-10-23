@@ -78,6 +78,34 @@ func (t *BunTransport) SetNoteExit(note func(string)) {
 	t.noteExit = note
 }
 
+// exitNoteKey marks a per-request capture cell for the exit address a
+// rotating proxy reports while dialing this request's tunnel.
+type exitNoteKey struct{}
+
+// ExitNote returns a fresh exit-address cell and a context carrying it. A
+// transport wired with SetNoteExit stores the address of each tunnel it dials
+// for that request; the caller reads it back after the response arrives, so
+// concurrent requests over one shared pool transport never attribute an
+// upstream verdict to another request's exit.
+func ExitNote() (*string, context.Context) {
+	cell := new(string)
+	return cell, context.WithValue(context.Background(), exitNoteKey{}, cell)
+}
+
+// noteExitFrom delivers the labeled exit address to the cell in ctx, if any,
+// and also to the transport-level callback.
+func (t *BunTransport) noteExitFrom(ctx context.Context, addr string) {
+	if addr == "" {
+		return
+	}
+	if cell, ok := ctx.Value(exitNoteKey{}).(*string); ok && cell != nil {
+		*cell = addr
+	}
+	if t.noteExit != nil {
+		t.noteExit(addr)
+	}
+}
+
 // NewBunTransport builds a BunTransport from options. A MaxIdleConnsPerHost
 // of zero keeps http.DefaultMaxIdleConnsPerHost, as http.Transport does.
 func NewBunTransport(options BunOptions) (*BunTransport, error) {

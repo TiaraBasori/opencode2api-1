@@ -136,7 +136,7 @@ func (t *BunTransport) dialProxy(ctx context.Context, addr string) (net.Conn, er
 		if socks {
 			err = socks5Connect(conn, t.proxy.User, addr)
 		} else {
-			conn, err = httpConnect(conn, t.proxy.User, addr, t.noteExit)
+			conn, err = httpConnect(conn, t.proxy.User, addr, func(addr string) { t.noteExitFrom(ctx, addr) })
 		}
 	}
 	if !stop() && err == nil {

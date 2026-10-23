@@ -429,6 +429,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			setRequestShape(ctx, false, toolAliases[index])
 			attempts++
+			// Per-attempt context: BunTransport stores the rotating pool's
+			// labeled exit address here while dialing this attempt's tunnel,
+			// so a 429 is attributed to the exact address that carried it
+			// even with concurrent requests over the shared #pool transport.
+			exitCell, exitCtx := httpx.ExitNote()
+			attemptCtx := context.WithValue(exitCtx, requestShapeContextKey{}, ctx.Value(requestShapeContextKey{}))
 			if meta := telemetry.MetaFromContext(ctx); meta != nil {
 				meta.Attempts = attemptOffset + attempts
 				meta.Tier = string(config.TierZen)
@@ -437,7 +443,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], ids, anonymousZenKey)
+			req, err := upstreamRequest(attemptCtx, baseURL, protocol, preparedBodies[index], ids, anonymousZenKey)
 			if err != nil {
 				return nil, err, attempts
 			}
@@ -502,7 +508,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				// drawing from it (a static exit has no per-address pool to
 				// inform) and keep walking to a fresh exit.
 				if resp.StatusCode == http.StatusTooManyRequests && node.proxy.pool {
-					g.banPoolExit(node.proxy, ids)
+					g.banPoolExit(node.proxy, *exitCell, ids)
 				}
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
@@ -566,8 +572,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 // drew a 429 quota verdict, so the pool can stop drawing from that /64. The
 // callback is fire-and-forget: the anonymous walk already continues on a fresh
 // exit, and a pool that does not understand the request is simply ignored.
-func (g *Gateway) banPoolExit(proxy *proxyTransport, ids identity.RequestIDs) {
-	exit := proxy.exitSnapshot()
+func (g *Gateway) banPoolExit(proxy *proxyTransport, exit string, ids identity.RequestIDs) {
 	if exit == "" {
 		return
 	}
