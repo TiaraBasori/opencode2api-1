@@ -35,6 +35,10 @@ type BunOptions struct {
 	IdleConnTimeout       time.Duration
 	MaxIdleConnsPerHost   int
 	DisableKeepAlives     bool
+	// NoteExit receives the exit address a rotating proxy reports per tunnel
+	// (X-V6-Exit on the CONNECT response), so a caller can attribute an
+	// upstream verdict to the address that carried it. Nil ignores the label.
+	NoteExit func(string)
 }
 
 // BunTransport is an http.RoundTripper that puts requests on the wire the way
@@ -58,9 +62,20 @@ type BunTransport struct {
 	idleTimeout           time.Duration
 	maxIdlePerHost        int
 	keepAlive             bool
+	// noteExit, when set, receives the exit address a rotating proxy reports
+	// for a fresh tunnel (X-V6-Exit on the CONNECT response). It is called
+	// synchronously during dial, before the request is written.
+	noteExit func(string)
 
 	mu   sync.Mutex
 	idle map[string][]*bunConn
+}
+
+// SetNoteExit sets the callback that receives the exit address a rotating
+// proxy reports per tunnel. It exists so the owner of the transport can be
+// wired after construction.
+func (t *BunTransport) SetNoteExit(note func(string)) {
+	t.noteExit = note
 }
 
 // NewBunTransport builds a BunTransport from options. A MaxIdleConnsPerHost
@@ -84,6 +99,7 @@ func NewBunTransport(options BunOptions) (*BunTransport, error) {
 		idleTimeout:           options.IdleConnTimeout,
 		maxIdlePerHost:        maxIdle,
 		keepAlive:             !options.DisableKeepAlives,
+		noteExit:              options.NoteExit,
 		idle:                  map[string][]*bunConn{},
 	}, nil
 }

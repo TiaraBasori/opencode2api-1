@@ -497,6 +497,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			} else {
 				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				// A 429 on the free tier is the per-IP quota verdict: the
+				// exit's /64 is spent for now. Tell the rotating pool to stop
+				// drawing from it (a static exit has no per-address pool to
+				// inform) and keep walking to a fresh exit.
+				if resp.StatusCode == http.StatusTooManyRequests && node.proxy.pool {
+					g.banPoolExit(node.proxy, ids)
+				}
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
 				break
@@ -553,6 +560,39 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 	}
 	return nil, lastErr, attempts
+}
+
+// banPoolExit tells a rotating proxy pool that the exit address it just used
+// drew a 429 quota verdict, so the pool can stop drawing from that /64. The
+// callback is fire-and-forget: the anonymous walk already continues on a fresh
+// exit, and a pool that does not understand the request is simply ignored.
+func (g *Gateway) banPoolExit(proxy *proxyTransport, ids identity.RequestIDs) {
+	exit := proxy.exitSnapshot()
+	if exit == "" {
+		return
+	}
+	clean, _ := config.ParseProxyEntry(proxy.name)
+	target, err := url.Parse(clean)
+	if err != nil || target.Host == "" {
+		return
+	}
+	go func() {
+		banCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(banCtx, http.MethodPost,
+			"http://"+target.Host+"/ban?addr="+url.QueryEscape(exit), nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			g.logger.Debug("pool ban callback failed", "component", "upstream", "event", "pool_ban_failed", "request_id", ids.Request, "proxy", config.RedactURL(proxy.name), "exit", exit, "error", err)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		g.logger.Info("banned a pool exit /64 after a 429 quota verdict", "component", "upstream", "event", "pool_exit_banned", "request_id", ids.Request, "proxy", config.RedactURL(proxy.name), "exit", exit, "status", resp.StatusCode)
+	}()
 }
 
 // anonymousUpstreams returns the ordered base URLs for the keyless free tier:

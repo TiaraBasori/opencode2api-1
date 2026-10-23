@@ -38,6 +38,27 @@ type proxyTransport struct {
 	healthy      atomic.Bool
 	checking     atomic.Bool
 	blockedUntil atomic.Int64
+	// lastExit is the exit address a rotating pool reported for the most
+	// recent tunnel (X-V6-Exit). It is advisory: it lets the anonymous walk
+	// tell its pool to stop using the /64 that just drew a quota verdict.
+	lastExit atomic.Value
+}
+
+// rememberExit records the exit address reported for the latest tunnel.
+func (t *proxyTransport) rememberExit(addr string) {
+	if t == nil || addr == "" {
+		return
+	}
+	t.lastExit.Store(addr)
+}
+
+// exitSnapshot returns the latest reported exit address, if any.
+func (t *proxyTransport) exitSnapshot() string {
+	if t == nil {
+		return ""
+	}
+	v, _ := t.lastExit.Load().(string)
+	return v
 }
 
 // proxyTransports holds every configured proxy route, indexed by
@@ -496,6 +517,12 @@ func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeade
 			return nil, fmt.Errorf("proxy %s: %w", config.RedactURL(raw), err)
 		}
 		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: transport}, bun: &http.Client{Transport: bun}}
+		if isPool {
+			// A rotating pool labels each tunnel with the exit address it
+			// drew; remember the latest on the transport so an upstream
+			// verdict (e.g. a 429 quota) can be attributed to it.
+			bun.SetNoteExit(proxy.rememberExit)
+		}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}
